@@ -6,6 +6,8 @@ pages in a real Chrome. Write the part between the agent and Chrome yourself, ov
 The deliverable is an MCP my agent can work with. It should work on a tab in front, or in the
 background while I use the same Chrome.
 
+## Usage: [USAGE](/USAGE.md)
+
 ## Some things it should do
 
 Each is given to the agent as one sentence and nothing else: no files, no links, no hints about

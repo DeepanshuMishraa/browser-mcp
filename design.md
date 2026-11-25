@@ -1,6 +1,6 @@
 # Initial Notes 
 
-Model Used: Opus 5.5 , reasoning: medium
+Model Used For Testing: Opus 5.5 , reasoning: medium
 
 ## What the agent sees, and why
 
