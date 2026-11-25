@@ -1,5 +1,7 @@
 # Initial Notes 
 
+Model Used: Opus 5.5 , reasoning: medium
+
 ## What the agent sees, and why
 
  - A screenshot takes a lot of tokens + the agent would need to guess for elements might not be totally accurate
@@ -33,7 +35,7 @@ So when in the second step you know when aaction would happen like click happens
 
 - Or we can just look at the DOM. So, if the DOM state is not changing, like we can observe the DOM with some way, and if the DOM state It remains thus like it changes after like say a certain amount of time and it is unchanged after that it means like re-render has happened or something has happened on the page and it means the same
 
-## how the agent learns what an action didhow the agent learns what an action did
+## how the agent learns what an action did
  
 
 - A diff would be a good thing which shows what changed from the original state in the accessibility tree. for eg: 
@@ -47,4 +49,18 @@ So when in the second step you know when aaction would happen like click happens
 - Captachas 
 - Extension popups 
 - OS Dialogs like file picker etc 
+
+
+
+# What changed 
+
+- Initally we were running one step per call and for the potrait task it costs $1.32 out of which most of the turns were just color changes because the color picker is not accessible so added `batch` to run many steps per call this should reduce the cost
+
+- for retina displays screenshot was 2x so we were getting coordinates wrong so scaled image to CSS pixels
+
+- diff is matched by ref → changed / added / removed, focus moved shown as one line
+
+
+- capped pages with long lists that agents might not need . so show only first 40 items for page more than 50 items and then use `find` tool to find the item we need and then snapshot it 
+
 

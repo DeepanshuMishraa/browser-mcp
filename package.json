@@ -1,0 +1,21 @@
+{
+  "name": "mini-browser-task",
+  "module": "src/index.ts",
+  "type": "module",
+  "scripts": {
+    "start": "bun src/index.ts",
+    "check": "tsc --noEmit"
+  },
+  "private": true,
+  "devDependencies": {
+    "@types/bun": "latest",
+    "devtools-protocol": "^0.0.1754134"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "zod": "4.6.7"
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "mini-browser": {
+      "command": "bun",
+      "args": ["src/index.ts"]
+    }
+  }
+}
