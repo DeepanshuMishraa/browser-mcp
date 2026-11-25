@@ -1,7 +1,8 @@
 // Turning refs into screen points, and sending mouse/keyboard input through CDP.
 // Input always goes to the top-level page session in viewport CSS pixels; this works for background tabs too.
-import { CdpError } from './cdp.ts';
+import { CdpError, type Session } from './cdp.ts';
 import { ToolError } from './browser.ts';
+import { parseRefLine, remember, snapshot } from './snapshot.ts';
 import type { RefTarget, Tab } from './tab.ts';
 
 export type Point = { x: number; y: number };
@@ -32,20 +33,21 @@ async function stale(t: RefTarget, ref: number, e: unknown): Promise<never> {
   throw new ToolError(`[${ref}] ${t.role} "${t.name}" is on the page but has no clickable box (hidden, display:none, or zero size). Nothing was done. Open the menu/section that contains it first.`);
 }
 
-/** Offset of an out-of-process iframe's viewport inside the top-level page. */
-async function frameOffset(tab: Tab, t: RefTarget) {
-  if (t.session === tab.page) return { x: 0, y: 0 };
+/** Offset of an out-of-process iframe's viewport inside the top-level page, summed through nested OOPIFs. */
+async function frameOffset(tab: Tab, session: Session, depth = 0): Promise<Point> {
+  if (session === tab.page || depth > 8) return { x: 0, y: 0 };
   let frameId: string | undefined;
-  for (const [id, s] of tab.oopifs) if (s === t.session) frameId = id;
+  for (const [id, s] of tab.oopifs) if (s === session) frameId = id;
   if (!frameId) return { x: 0, y: 0 };
   // The <iframe> element lives in the parent frame's session: try the page first, then other OOPIFs.
   for (const s of [tab.page, ...tab.oopifs.values()]) {
-    if (s === t.session) continue;
+    if (s === session) continue;
     try {
       const { backendNodeId } = await s.send('DOM.getFrameOwner', { frameId });
       const { model } = await s.send('DOM.getBoxModel', { backendNodeId });
       const [x = 0, y = 0] = model.content;
-      return { x, y };
+      const parent = await frameOffset(tab, s, depth + 1);
+      return { x: x + parent.x, y: y + parent.y };
     } catch {
       // not the owner session
     }
@@ -53,20 +55,47 @@ async function frameOffset(tab: Tab, t: RefTarget) {
   return { x: 0, y: 0 };
 }
 
+/**
+ * A ref whose element was replaced (re-render, dialog reopened) → the one element now on the page
+ * with the same role and name, if exactly one exists. Saves the agent a snapshot turn.
+ */
+async function rebind(tab: Tab, ref: number, t: RefTarget) {
+  const snap = await snapshot(tab).catch(() => undefined);
+  if (!snap) return undefined;
+  const same = snap.lines.map(parseRefLine).filter((p) => p !== undefined && p.ref !== ref && p.role === t.role && p.name === t.name);
+  const only = same.length === 1 ? same[0] : undefined;
+  if (!only) return undefined;
+  remember(tab, snap);
+  tab.log(`[${ref}] was replaced on the page; used [${only.ref}] ${only.role}${only.name ? ` "${only.name}"` : ''} (same role and name)`);
+  return only.ref;
+}
+
 /** Scrolls the element into view and returns the centre of its first visible box. */
-export async function pointFor(tab: Tab, ref: number) {
+export async function pointFor(tab: Tab, ref: number, rebound = false): Promise<Point> {
   const t = target(tab, ref);
   try {
     await t.session.send('DOM.scrollIntoViewIfNeeded', { backendNodeId: t.backendNodeId }).catch(() => undefined);
     const { quads } = await t.session.send('DOM.getContentQuads', { backendNodeId: t.backendNodeId });
     const quad = quads.find((q) => Math.abs((q[4] ?? 0) - (q[0] ?? 0)) > 1 && Math.abs((q[5] ?? 0) - (q[1] ?? 0)) > 1);
-    if (!quad) throw new ToolError(`[${ref}] ${t.role} "${t.name}" has no visible size (hidden or collapsed). Nothing was done.`);
+    if (!quad) {
+      // A detached node that is not garbage-collected yet has no boxes rather than an error.
+      if (!rebound && !(await isConnected(t))) {
+        const next = await rebind(tab, ref, t);
+        if (next !== undefined) return pointFor(tab, next, true);
+        return stale(t, ref, new CdpError('DOM.getContentQuads', undefined, 'node detached'));
+      }
+      throw new ToolError(`[${ref}] ${t.role} "${t.name}" has no visible size (hidden or collapsed). Nothing was done.`);
+    }
     const xs = [quad[0], quad[2], quad[4], quad[6]].map(Number);
     const ys = [quad[1], quad[3], quad[5], quad[7]].map(Number);
-    const off = await frameOffset(tab, t);
+    const off = await frameOffset(tab, t.session);
     return { x: (Math.min(...xs) + Math.max(...xs)) / 2 + off.x, y: (Math.min(...ys) + Math.max(...ys)) / 2 + off.y };
   } catch (e) {
     if (e instanceof ToolError) throw e;
+    if (!rebound && e instanceof CdpError && !(await isConnected(t))) {
+      const next = await rebind(tab, ref, t);
+      if (next !== undefined) return pointFor(tab, next, true);
+    }
     return stale(t, ref, e);
   }
 }
@@ -123,15 +152,16 @@ export async function click(tab: Tab, p: Point, opts: { button?: Button; count?:
   }
 }
 
-/** Waits for `p`, unless a JS dialog opens first (then returns without waiting; `p` resolves once the dialog closes). */
-async function raceDialog(tab: Tab, p: Promise<unknown>) {
+/** Waits for `p`, unless a JS dialog opens first (then returns undefined without waiting; `p` resolves once the dialog closes). */
+export async function raceDialog<T>(tab: Tab, p: Promise<T>) {
   let done = false;
   p.then(
     () => (done = true),
     () => (done = true),
   );
   while (!done && !tab.dialog) await new Promise((r) => setTimeout(r, 20));
-  if (!tab.dialog) await p;
+  if (tab.dialog) return undefined;
+  return await p;
 }
 
 /** Press at the first point, move through the rest (interpolated), release at the last. For drawing, sliders, drag-and-drop. */
@@ -201,7 +231,8 @@ const MAC_COMMANDS: Record<string, string> = { a: 'selectAll', c: 'copy', x: 'cu
 
 /** Press a key or combo like "Enter", "Meta+A", "Shift+Tab". */
 export async function press(tab: Tab, combo: string) {
-  const parts = combo.split('+').map((s) => s.trim()).filter(Boolean);
+  // Split on "+" except a trailing one, so "Meta++" is Meta and the + key.
+  const parts = combo.split(/\+(?!$)/).map((s) => s.trim()).filter(Boolean);
   const keyName = parts.pop();
   if (!keyName) throw new ToolError(`Empty key combo "${combo}".`);
   let modifiers = 0;

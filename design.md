@@ -63,4 +63,30 @@ So when in the second step you know when aaction would happen like click happens
 
 - capped pages with long lists that agents might not need . so show only first 40 items for page more than 50 items and then use `find` tool to find the item we need and then snapshot it 
 
+- settle was waiting 500ms for both network and DOM after every action which was too slow so now its 250ms DOM and 300ms network, and only requests that start after the action count. analytics/telemetry requests are ignored since they keep firing on their own
+
+- pages that are always changing (video playing, live cursors) never go quiet so they were hitting the 5s timeout every time. now if the page was already changing before the action we just wait a fixed 300ms
+
+- every action was taking a full snapshot before and after which is slow on big pages so now the last snapshot is reused as the "before" if the page hasnt changed (a mutation counter in the page tells us that)
+
+- diff was printing the whole old line and whole new line for a change so now it only shows what changed like `value="a@b.c"`
+
+- in `batch` the agent can click/type by name + role instead of ref so one call can open a menu, click an item and fill the dialog without taking a snapshot in between
+
+- if a ref went stale because the element re-rendered we now pick the one element with same role and name instead of failing
+
+- agent wasnt using `batch` at all in one run because claude code only shows mcp tool names until the tool is loaded. so added server instructions that tell it to use `batch` , in the cross site run 34 of 74 calls were batch
+
+- screenshots stay in context for every turn after so batch screenshots are now half size by default and can be cropped to the canvas
+
+- file pickers: `showOpenFilePicker`/`showSaveFilePicker` always open a native dialog we cant handle so we remove them from the page and apps fall back to normal file input and downloads. also added `drop_files` and `paste` so files can go in without any picker
+
+- added `paste` for sheets/docs so a whole table can be pasted in one call instead of typing cell by cell
+
+- removed bring to front, agent should never move the users tabs
+
+- tried adding shape filling for painting (ellipse, rect) but removed it since it only helps drawing tasks and real apps have their own shape tools
+
+- kleki: $1.31 in 242s before → $1.16 in 219s after. mcp time went 44s → 18s but model time stayed ~200s so next thing to cut is turns not mcp speed
+
 

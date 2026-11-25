@@ -44,7 +44,10 @@ Other MCP clients (Claude Desktop, Cursor, …):
 | `screenshot` | Viewport or one element. Image pixels equal CSS pixels, so coordinates go straight to mouse tools |
 | `click`, `hover`, `type`, `press`, `select_option`, `scroll` | Act on refs. `type` uses `Input.insertText`, so it works for rich text and code editors |
 | `mouse_click`, `mouse_drag`, `mouse_strokes` | Coordinate input for canvas apps, sliders, drag and drop. `mouse_strokes` paints many strokes in one call |
-| `upload` | `<input type=file>`, or a button that opens a picker (the picker is intercepted) |
+| `batch` | Many steps in one call. `click`/`type`/`hover` take a ref or a `name` (+`role`) resolved when the step runs, so one call can walk a menu → dialog → form. Also `wait_for` and `screenshot` steps. `report: "none"` skips the before/after page read for canvas work |
+| `paste` | Synthetic paste of text, HTML or files into the focused element: tab-separated rows fill a spreadsheet range in one call |
+| `drop_files` | Drop local files onto an element or point (editors and upload areas that accept drops) |
+| `upload` | `<input type=file>`, or a button that opens a picker (the picker is intercepted). The File System Access pickers are removed from pages so apps fall back to this |
 | `dialog` | Accept or dismiss alert, confirm, prompt or beforeunload |
 | `wait_for` | Wait for text to appear or disappear (exports, uploads) |
 | `downloads`, `grant_permissions`, `eval_js` | Download tracking, permission grants, JS escape hatch |

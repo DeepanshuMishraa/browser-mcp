@@ -37,12 +37,15 @@ function isFocusable(node: AXNode) {
   return node.properties?.some((p) => p.name === 'focusable' && p.value.value === true) ?? false;
 }
 
-type Ctx = { tab: Tab; lines: string[]; max: number; truncated: boolean; capLists: boolean };
+type Ctx = { tab: Tab; lines: string[]; max: number; truncated: boolean; capLists: boolean; prefetched: Map<Session, Promise<AXNode[]>> };
+
+const fullTree = (session: Session) => session.send('Accessibility.getFullAXTree', {}).then((r) => r.nodes);
 
 async function renderFrame(ctx: Ctx, session: Session, frameId: string | undefined, depth: number) {
   let nodes: AXNode[];
   try {
-    ({ nodes } = await session.send('Accessibility.getFullAXTree', frameId ? { frameId } : {}));
+    const pre = frameId ? undefined : ctx.prefetched.get(session);
+    nodes = pre ? await pre : (await session.send('Accessibility.getFullAXTree', frameId ? { frameId } : {})).nodes;
   } catch (e) {
     ctx.lines.push(`${'  '.repeat(depth)}(frame not readable: ${e instanceof Error ? e.message : String(e)})`);
     return;
@@ -120,10 +123,25 @@ const PAGE_INFO = `JSON.stringify({
   sh: document.documentElement ? document.documentElement.scrollHeight : 0,
   canvases: [...document.querySelectorAll('canvas')].map(c => c.getBoundingClientRect())
     .filter(r => r.width * r.height > 60000 && r.bottom > 0 && r.top < innerHeight)
-    .map(r => [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)])
+    .map(r => [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)]),
+  media: [...document.querySelectorAll('video, audio')].filter(m => m.duration > 0).slice(0, 3)
+    .map(m => [m.tagName.toLowerCase(), Math.round(m.currentTime * 10) / 10, isFinite(m.duration) ? Math.round(m.duration * 10) / 10 : -1, m.paused]),
+  v: window.__mbMutations ?? -1
 })`;
 
-type PageInfo = { title: string; url: string; w: number; h: number; sx: number; sy: number; sh: number; canvases: [number, number, number, number][] };
+type PageInfo = {
+  title: string;
+  url: string;
+  w: number;
+  h: number;
+  sx: number;
+  sy: number;
+  sh: number;
+  canvases: [number, number, number, number][];
+  media: [string, number, number, boolean][];
+  /** DOM mutation count of the top document when this was read. */
+  v: number;
+};
 
 export async function pageInfo(tab: Tab) {
   const r = await tab.page.send('Runtime.evaluate', { expression: PAGE_INFO, returnByValue: true }, 3000);
@@ -135,14 +153,22 @@ export type Snapshot = { header: string[]; lines: string[]; truncated: boolean; 
 
 /** `full` = no line limit and no list capping (for find / wait_for / diffs). */
 export async function snapshot(tab: Tab, max: number | 'full' = 'full') {
-  const ctx: Ctx = { tab, lines: [], max: max === 'full' ? Number.POSITIVE_INFINITY : max, truncated: false, capLists: max !== 'full' };
   if (tab.dialog) {
     // The page cannot answer anything while a JS dialog is open.
     const blocked: Snapshot = { header: [`BLOCKED by ${tab.dialog.type} dialog: ${quote(tab.dialog.message)}. Use dialog to accept or dismiss it first.`], lines: [], truncated: false, info: undefined };
     return blocked;
   }
-  await renderFrame(ctx, tab.page, undefined, 0);
+  // Read info (with the mutation count) before the tree, so a change during the read makes the snapshot look stale, not fresh.
   const info = await pageInfo(tab).catch(() => undefined);
+  // Fetch every frame's tree at once; the walk then only waits for ones it has not received yet.
+  const prefetched = new Map<Session, Promise<AXNode[]>>();
+  for (const s of [tab.page, ...tab.oopifs.values()]) {
+    const p = fullTree(s);
+    p.catch(() => undefined);
+    prefetched.set(s, p);
+  }
+  const ctx: Ctx = { tab, lines: [], max: max === 'full' ? Number.POSITIVE_INFINITY : max, truncated: false, capLists: max !== 'full', prefetched };
+  await renderFrame(ctx, tab.page, undefined, 0);
   const header: string[] = [];
   if (info) {
     header.push(`page ${quote(info.title)} ${info.url}`);
@@ -150,10 +176,36 @@ export async function snapshot(tab: Tab, max: number | 'full' = 'full') {
     for (const [x, y, w, h] of info.canvases) {
       header.push(`canvas at x=${x} y=${y} size ${w}x${h}: its drawing is not in this text; use screenshot to see it and mouse_* tools with those coordinates`);
     }
+    for (const [tag, at, duration, paused] of info.media) {
+      header.push(`${tag} at ${at}s of ${duration < 0 ? 'live' : `${duration}s`}, ${paused ? 'paused' : 'playing'}`);
+    }
   }
   if (tab.fileChooser) header.push('a file picker is waiting: call upload with file paths');
   const snap: Snapshot = { header, lines: ctx.lines, truncated: ctx.truncated, info };
   return snap;
+}
+
+const REF_LINE = /^\s*\[(\d+)\] (\S+)(?: ("(?:[^"\\]|\\.)*"))?/;
+
+/** `[12] button "Save" …` → { ref: 12, role: 'button', name: 'Save' }; undefined for text lines. */
+export function parseRefLine(line: string) {
+  const m = REF_LINE.exec(line);
+  if (!m?.[1] || !m[2]) return undefined;
+  let name = '';
+  if (m[3]) {
+    try {
+      const v: unknown = JSON.parse(m[3]);
+      if (typeof v === 'string') name = v;
+    } catch {
+      // clipped or malformed quote: treat as unnamed
+    }
+  }
+  return { ref: Number(m[1]), role: m[2], name };
+}
+
+/** Keep a full snapshot as the tab's reference point for the next action's diff. */
+export function remember(tab: Tab, snap: Snapshot) {
+  tab.lastSnapshot = snap.info ? { lines: snap.lines, version: snap.info.v, url: snap.info.url } : undefined;
 }
 
 /** The lines of one ref's subtree (by indentation). */

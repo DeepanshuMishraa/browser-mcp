@@ -5,9 +5,19 @@ import { type CdpConnection, Session } from './cdp.ts';
 export const MUTATION_SCRIPT = `(() => {
   if (window.__mbLastMutation !== undefined) return;
   window.__mbLastMutation = performance.now();
-  const bump = () => { window.__mbLastMutation = performance.now(); };
+  window.__mbMutations = 0;
+  const bump = () => { window.__mbLastMutation = performance.now(); window.__mbMutations++; };
   const start = () => new MutationObserver(bump).observe(document, { subtree: true, childList: true, attributes: true, characterData: true });
   if (document.documentElement) start(); else document.addEventListener('DOMContentLoaded', start, { once: true });
+})()`;
+
+// The File System Access pickers open a native OS dialog that CDP cannot answer. Without them, apps
+// (Photopea, Excalidraw, …) fall back to <input type=file> and <a download>, which we can intercept.
+const NO_FS_PICKERS_SCRIPT = `(() => {
+  for (const n of ['showOpenFilePicker', 'showSaveFilePicker', 'showDirectoryPicker']) {
+    try { delete window[n]; } catch {}
+    try { delete Window.prototype[n]; } catch {}
+  }
 })()`;
 
 /** Where a ref points: a DOM node inside a specific session (page or OOPIF). */
@@ -19,6 +29,8 @@ type Request = { startedAt: number; type: string | undefined; url: string };
 
 // Requests that never "finish" in a useful sense; counting them would mean the page never settles.
 const IGNORED_REQUEST_TYPES = new Set(['WebSocket', 'EventSource', 'Media', 'Ping', 'Preflight']);
+// Telemetry and long-poll endpoints fire on their own and say nothing about the action's result.
+const IGNORED_REQUEST_URL = /\/(log|logs|gen_204|collect|beacon|analytics|telemetry|metrics|ping|heartbeat|stats|ptracking|jserror|csi)\b|google-analytics|googletagmanager|doubleclick|sentry\.io|segment\.(io|com)|mixpanel|amplitude|hotjar|clarity\.ms/i;
 const LONG_REQUEST_MS = 5_000;
 
 export class Tab {
@@ -36,8 +48,8 @@ export class Tab {
   fileChooser: { backendNodeId: number; multiple: boolean } | undefined;
   /** Things that happened since the last action report (dialogs, popups, downloads, errors). */
   events: string[] = [];
-  /** Lines of the last full snapshot, used for diffs. */
-  lastSnapshot: string[] | undefined;
+  /** The last full snapshot and the page's mutation count when it was read; reused as an action's "before" if nothing changed since. */
+  lastSnapshot: { lines: string[]; version: number; url: string } | undefined;
 
   constructor(
     readonly conn: CdpConnection,
@@ -97,6 +109,8 @@ export class Tab {
       s.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: false, flatten: true }),
       s.send('Page.addScriptToEvaluateOnNewDocument', { source: MUTATION_SCRIPT }),
       s.send('Runtime.evaluate', { expression: MUTATION_SCRIPT }),
+      s.send('Page.addScriptToEvaluateOnNewDocument', { source: NO_FS_PICKERS_SCRIPT }),
+      s.send('Runtime.evaluate', { expression: NO_FS_PICKERS_SCRIPT }),
     ];
     if (isPage) {
       enable.push(
@@ -111,7 +125,7 @@ export class Tab {
   // Keyed by requestId alone: an iframe's document request starts in the parent session
   // but finishes in the iframe's own session once it becomes an OOPIF.
   #requestStarted(requestId: string, type: Protocol.Network.ResourceType | undefined, url: string) {
-    if (type && IGNORED_REQUEST_TYPES.has(type)) return;
+    if ((type && IGNORED_REQUEST_TYPES.has(type)) || IGNORED_REQUEST_URL.test(url)) return;
     this.#requests.set(requestId, { startedAt: performance.now(), type, url });
     this.lastNetworkChange = performance.now();
   }
@@ -120,10 +134,12 @@ export class Tab {
     if (this.#requests.delete(requestId)) this.lastNetworkChange = performance.now();
   }
 
-  /** Requests still in flight, ignoring long-lived ones (long-polling, streaming). */
-  inflight() {
+  /** Requests still in flight, ignoring long-lived ones (long-polling, streaming). `since`: only requests started at or after this time. */
+  inflight(since = 0) {
     const now = performance.now();
-    return [...this.#requests.values()].filter((r) => now - r.startedAt < LONG_REQUEST_MS).map((r) => `${r.type ?? '?'} ${r.url.slice(0, 80)}`);
+    return [...this.#requests.values()]
+      .filter((r) => r.startedAt >= since && now - r.startedAt < LONG_REQUEST_MS)
+      .map((r) => `${r.type ?? '?'} ${r.url.slice(0, 80)}`);
   }
 
   #log(event: string) {
