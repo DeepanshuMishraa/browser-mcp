@@ -164,6 +164,10 @@ export async function raceDialog<T>(tab: Tab, p: Promise<T>) {
   return await p;
 }
 
+/** About one animation frame at 60Hz, plus margin. */
+const DRAG_DWELL_MS = 20;
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
 /** Press at the first point, move through the rest (interpolated), release at the last. For drawing, sliders, drag-and-drop. */
 export async function drag(tab: Tab, path: Point[], opts: { button?: Button; modifiers?: number; stepPx?: number } = {}) {
   const [first, ...rest] = path;
@@ -173,6 +177,8 @@ export async function drag(tab: Tab, path: Point[], opts: { button?: Button; mod
   const step = opts.stepPx ?? 6;
   await mouseMove(tab, first, 'none', modifiers);
   await tab.page.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: first.x, y: first.y, button, buttons: 1, clickCount: 1, modifiers });
+  // Many drag libraries and canvas apps start a drag on the next animation frame after the press.
+  await sleep(DRAG_DWELL_MS);
   // CDP handles commands in order, so moves are pipelined and awaited together (much faster strokes).
   const moves: Promise<void>[] = [];
   let prev = first;
@@ -184,6 +190,11 @@ export async function drag(tab: Tab, path: Point[], opts: { button?: Button; mod
     prev = p;
   }
   await Promise.all(moves);
+  // Hover over the end point for a frame, then move once more, so drop targets (and connectors that
+  // bind to shapes) see the pointer resting there before the release.
+  await sleep(DRAG_DWELL_MS);
+  await mouseMove(tab, prev, button, modifiers);
+  await sleep(DRAG_DWELL_MS);
   await tab.page.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: prev.x, y: prev.y, button, buttons: 0, clickCount: 1, modifiers });
 }
 

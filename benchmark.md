@@ -9,7 +9,7 @@ Raw data for every run is in `logs/`: `benchmark-*.json` / `bench-*.json` (metri
 
 ## How a run is measured
 
-- **Agent:** Claude Code, Opus 5.5, effort low. Each task is given as one sentence with no hints.
+- **Agent:** Claude Code, Opus 5.5, effort medium. Each task is given as one sentence with no hints.
 - **Time:** from the first mini-browser call to the task's last action.
 - **Turns and tokens:** summed from the session transcript (`~/.claude/projects/<project>/<session>.jsonl`),
   assistant messages in that window, deduped by `message.id`.
@@ -87,31 +87,106 @@ front, telling the agent to use `batch` for any sequence it can plan.
 > trailer stats with a link to the sheet. Finally, draft (don't send) a Gmail to yourself with the
 > doc link and the Photopea PNG attached.
 
-| | mini-browser (with server instructions) | Codex |
-|---|---|---|
-| Completed | yes, all 6 apps | not run yet |
-| Wall time | 333s | |
-| MCP time | 110.3s | |
-| Model turns | 59 | |
-| MCP calls | 74 (34 `batch`) | |
-| Screenshots | 28 | |
-| Output tokens | 17.4k | |
-| Avg context per turn | 83k | |
-| Cost | $1.76 | |
+| | v1 (server instructions) | v2 (settle, batch, screenshot, snapshot, drag, schema fixes) | Change | Codex |
+|---|---|---|---|---|
+| Completed | yes, all 6 apps | yes, all 6 apps | | not run yet |
+| Wall time | 333s | 251s | **-25%** | |
+| MCP time | 110.3s | 83.9s | **-24%** | |
+| Model time (wall minus MCP) | 223s | 168s | -25% | |
+| Model turns | 59 | 52 | -12% | |
+| MCP calls | 74 (34 `batch`) | 54 (25 `batch`) | -27% | |
+| Steps per `batch` | 6.8 (231 steps) | 4.6 (115 steps) | | |
+| `wait` steps in batches | 39 (21.5s) | 9 (11.1s) | -77% | |
+| `read` steps | n/a | 7 | | |
+| Screenshots | 28 (644KB) | 17 (330KB), 0 omitted as unchanged | **-39%** | |
+| Settle timeouts ("did not settle") | 5 (~27s) | 1 (5.5s) | -4 | |
+| "still loading in background" | n/a | 6 (settled in 1.5-3.5s) | | |
+| Failed steps or calls | 2 | 3 | +1 | |
+| Text returned by the MCP | 34.4k chars | 25.1k chars | -27% | |
+| Output tokens | 17.4k | 11.0k | -37% | |
+| Avg context per turn | 83k | 71k | -15% | |
+| Context at first turn | 53.6k | 53.3k | same | |
+| Cost: output | $0.35 | $0.22 | | |
+| Cost: cache read | $0.97 (4.83M) | $0.73 (3.63M) | | |
+| Cost: cache write | $0.44 (55.5k) | $0.34 (43.0k) | | |
+| **Cost: total** | **$1.76** | **$1.29** | **-27%** | |
 
-Data: `logs/bench-cross-site.json`, trace `logs/2026-11-25T16-17-37-794Z.jsonl`, output `logs/bench-cross-site.png`.
+Per-tool time (calls × total ms):
+
+| Tool | v1 | v2 |
+|---|---|---|
+| `batch` | 34 × 56.3s (avg 1.66s) | 25 × 50.2s (avg 2.01s, 1 error) |
+| `eval_js` | 6 × 12.4s | 4 × 15.0s |
+| `wait_for` | 6 × 11.7s | 0 (6 `wait_for` steps inside batches) |
+| `tab_open` | 6 × 4.5s | 5 × 7.1s |
+| `navigate` | 1 × 5.2s | 1 × 5.5s |
+| `paste` | 3 × 8.0s | 3 × 4.1s |
+| `click` | 2 × 5.8s | 0 |
+| `upload` | 1 × 5.2s | 1 × 0.8s |
+| `drop_files` | 1 × 0.6s | 1 × 0.5s |
+| `screenshot` / `snapshot` | 6 × 0.4s | 7 × 0.4s |
+| `find` | 6 × 0.2s | 4 × 0.3s |
+| `downloads` | 2 × 0s | 3 × 0s |
+
+Data: v1 `logs/bench-cross-site.json`, trace `logs/2026-11-25T16-17-37-794Z.jsonl`, output
+`logs/bench-cross-site.png`. v2 `logs/bench-cross-site-v2.json`, trace `logs/2026-11-26T05-51-29-524Z.jsonl`.
+
+Both runs started fresh at about 53k tokens of context, so the cost comparison holds. Running the
+v2 script on the v1 data gives 60 turns and $1.82 instead of the published 59 and $1.76. That gap
+is under 4% and makes v1 look slightly worse, so the v2 gains above, if anything, understate the
+improvement.
 
 The server instructions worked: 34 of 74 calls were `batch` (zero in the discarded Kleki run).
 `paste`, `drop_files`, `upload`, `wait_for` and `downloads` were all used on real sites.
 
+#### What the numbers say (v1 → v2)
+
+Improved:
+
+- **Settle on Google apps.** Settle timeouts went from 5 (about 27s) to 1. The settle network
+  filter (images and fonts ignored, stop once the DOM is quiet 500ms) let Sheets, Docs and Gmail
+  return in 1.5-3.5s with the leftover requests listed. `paste` fell from 8.0s to 4.1s and `upload`
+  from 5.2s to 0.8s. The one timeout left was the YouTube watch page, where the video kept the DOM
+  changing.
+- **Fewer wait steps and calls.** With waits between batch steps, the agent used 9 `wait` steps
+  instead of 39 and made no standalone `wait_for` or `click` calls. The `read` step (7 uses) closed
+  batches with the result, for example the Gmail field lookup and the Drafts count. Calls fell 27%.
+- **Fewer, smaller screenshots.** 17 instead of 28, at half the total size (330KB vs 644KB), because
+  of half-scale defaults and `clip`. This is most of the 23% drop in cache writes. The
+  unchanged-image dedupe never triggered (0 omitted).
+- **Less text per turn.** The MCP returned 27% less text, and average context per turn fell from
+  83k to 71k. With 7 fewer turns, cache reads fell by 1.2M tokens ($0.24), the largest cost saving.
+  The compact snapshot helps here through the snapshots that `navigate` and `tab_open` return; the
+  agent never called `snapshot` itself.
+- **Excalidraw.** Three boxes, labels and two arrows went in one 23-step batch and were checked
+  with one `eval`; v1 lost about 12 turns there. The arrows started outside the boxes this time,
+  so this run does not test the drag-timing fix.
+- **Trimmed schemas: not measurable here.** Context at the first turn was the same (53.3k vs 53.6k)
+  because Claude Code loads schemas lazily, and the saving is about 1.5k tokens.
+
+Got worse:
+
+- **Average `batch` time went up 21%** (1.66s to 2.01s). Each step now waits up to 1.5s for the DOM,
+  and one Gmail batch spent 3s on a failed name lookup. Total batch time still fell.
+- **`tab_open` on Gmail went from 0.3s to 3.1s.** v1 returned before Gmail had rendered; v2 waited
+  for the DOM to go quiet. The total `tab_open` time rose from 4.5s to 7.1s.
+- **Failures went from 2 to 3.** One was the agent inventing a `paste_skip` step, which schema
+  validation rejected in 3ms with nothing run. Photopea's "Export as" hover failed in both runs.
+  Gmail "To recipients" failed because two compose windows were open; see below.
 
 Agent or environment problems (not the MCP):
 
-- Sheets read `2:24` as a time; the agent needed 3 turns to re-enter it as text.
-- Excalidraw already held a drawing from the shared browser profile, and arrows drawn from inside a
-  box did not bind: about 12 turns.
+- Sheets read `2:24` as a time. v1 needed 3 turns to re-enter it as text; v2 needed 9 calls before
+  writing `2m 24s` instead. This was the largest single loss in v2.
+- Excalidraw (v1) already held a drawing from the shared browser profile, and arrows drawn from
+  inside a box did not bind: about 12 turns.
 - Photopea's scripting API posts results to `window.parent`, so it returns nothing in a top-level
-  tab; the agent fell back to the File > Export as menu (4 turns, 12s of `eval`).
-- A first attempt hit a Google sign-in confirmation page; the measured run is the second attempt.
+  tab. Both runs fell back to File > Export as. v1 spent 12s of `eval` on this; v2 spent 15s on two
+  `eval`s that waited 5s and 10s for replies. Photopea menu items have no accessible names, so the
+  name-based hover failed both times.
+- Gmail (v2): opening `#inbox?compose=new` and then clicking Compose opened two compose windows.
+  The agent discarded one, and the draft count went from 3 to 4.
+- A first v1 attempt hit a Google sign-in confirmation page; the measured v1 run is the second attempt.
+- The agent still added 9 `wait` steps, although the server instructions say steps wait on their own.
 
 

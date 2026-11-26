@@ -174,7 +174,7 @@ export async function snapshot(tab: Tab, max: number | 'full' = 'full') {
     header.push(`page ${quote(info.title)} ${info.url}`);
     header.push(`viewport ${info.w}x${info.h}, scrolled to y=${info.sy} of ${info.sh}`);
     for (const [x, y, w, h] of info.canvases) {
-      header.push(`canvas at x=${x} y=${y} size ${w}x${h}: its drawing is not in this text; use screenshot to see it and mouse_* tools with those coordinates`);
+      header.push(`canvas x=${x} y=${y} ${w}x${h} (pixels only: screenshot + mouse tools)`);
     }
     for (const [tag, at, duration, paused] of info.media) {
       header.push(`${tag} at ${at}s of ${duration < 0 ? 'live' : `${duration}s`}, ${paused ? 'paused' : 'playing'}`);
@@ -206,6 +206,18 @@ export function parseRefLine(line: string) {
 /** Keep a full snapshot as the tab's reference point for the next action's diff. */
 export function remember(tab: Tab, snap: Snapshot) {
   tab.lastSnapshot = snap.info ? { lines: snap.lines, version: snap.info.v, url: snap.info.url } : undefined;
+}
+
+/**
+ * At most `max` lines for a page the agent has not seen yet. Plain text lines go first (names of
+ * elements already carry most meaning, and find still searches the text); then elements are cut.
+ */
+export function compactView(lines: string[], max: number) {
+  if (lines.length <= max) return lines;
+  const elements = lines.filter((l) => REF_LINE.test(l));
+  const hidden = lines.length - elements.length;
+  if (elements.length + 1 <= max) return [...elements, `… ${hidden} text lines hidden (find searches them)`];
+  return [...elements.slice(0, max - 1), `… ${elements.length - (max - 1)} more elements (use find, or snapshot with a ref)`];
 }
 
 /** The lines of one ref's subtree (by indentation). */

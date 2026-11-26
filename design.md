@@ -89,4 +89,20 @@ So when in the second step you know when aaction would happen like click happens
 
 - kleki: $1.31 in 242s before → $1.16 in 219s after. mcp time went 44s → 18s but model time stayed ~200s so next thing to cut is turns not mcp speed
 
+- cross-site run: 5 actions hit the 5s settle timeout (25s of 110s mcp time), all waiting on background icons, gifs and iframes on Gmail/Docs. images and fonts no longer count for settle, and once the DOM has been quiet 500ms (and 1.5s have passed) we stop waiting for the network and list what is still loading
+
+- 19 of 34 batches had 3 steps or fewer, usually `click, wait 1500, screenshot`, because steps did not wait for the page between them. now batch waits for the DOM to go quiet (150ms, max 1.5s) after click/type/press/mouse_click/hover, and has a `read` step (find by text or subtree by ref) so one batch can act and return the result
+
+- batch clicks now warn when something covers the click point, same as `click`
+
+- screenshots stay in context every turn after, so `screenshot` and the automatic one for empty trees now default to half scale (about 4x fewer tokens), an image identical to the previous one is replaced by a text line, and `clip` [x,y,w,h] crops to a rectangle
+
+- the full snapshot after a navigation was 300 lines (4KB on Gmail, mostly nav chrome). now 150 lines, and when the page does not fit, plain text lines are dropped first (element names carry most meaning, and find still searches text). the canvas header no longer repeats usage advice in every snapshot
+
+- drag pressed and moved in the same instant, so apps that start a drag on the next frame, or bind arrows to the shape under the release, missed it (12 turns on Excalidraw arrows). drag now rests one frame after the press and over the end point before releasing (about 60ms per stroke)
+
+- name lookups in batch and wait_for re-read the whole tree / all text every 100-150ms. now they only re-read when the top document's mutation count changed, plus once a second for changes inside iframes
+
+- tool schemas went 22.0k → 16.3k chars (26 tools). `z.number().int()` wrote ±2^53 bounds into every integer field (81 times), now `multipleOf(1)`; the `tab` param description was repeated in 21 tools; descriptions no longer repeat the cost advice that is already in the server instructions. kept all tools: merging them would save about $0.04 a run and break callers
+
 

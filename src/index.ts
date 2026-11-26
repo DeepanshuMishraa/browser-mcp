@@ -2,10 +2,10 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { basename, resolve } from 'node:path';
 import { z } from 'zod';
-import { act, waitForSettle } from './act.ts';
+import { act, describeSettle, FULL_SNAPSHOT_LINES, LIST_CAPPED, pageVersion, shouldReread, waitBetweenSteps, waitForSettle } from './act.ts';
 import { Browser, ToolError } from './browser.ts';
 import { click, coveredBy, drag, insertText, mouseMove, pointFor, press, raceDialog, target, wheel } from './input.ts';
-import { pageInfo, parseRefLine, remember, snapshot, subtree } from './snapshot.ts';
+import { compactView, pageInfo, parseRefLine, remember, snapshot, subtree } from './snapshot.ts';
 import type { Tab } from './tab.ts';
 import { trace } from './trace.ts';
 
@@ -13,7 +13,7 @@ import { trace } from './trace.ts';
 // tool is picked, but always show these instructions. They say which tools to reach for first.
 const INSTRUCTIONS = `Drives the user's real Chrome over CDP. Works on background tabs without switching.
 - Read a page with snapshot (accessibility tree with [ref] numbers). Use find on long pages. Use screenshot for canvases and visual checks; scale 0.5 is enough to check progress.
-- Act with batch whenever you can plan more than one step: it runs many steps in one call (click/type/hover by ref or by name+role, mouse_click, drag, strokes, scroll, press, eval, wait_for, screenshot). Every call re-sends the whole conversation, so one batch per phase of work is much cheaper than one call per action. Use report "none" for canvas work.
+- Act with batch whenever you can plan more than one step: it runs many steps in one call (click/type/hover by ref or by name+role, mouse_click, drag, strokes, scroll, press, eval, wait_for, screenshot). Every call re-sends the whole conversation, so one batch per phase of work is much cheaper than one call per action. Use report "none" for canvas work. Steps wait for the page to settle on their own; don't add wait steps. End a batch with read (query) or eval to get the result back instead of spending a turn on snapshot.
 - Every action returns what changed (diff, URL, dialogs, new tabs, downloads), so you rarely need a snapshot after acting.
 - paste fills spreadsheets (tab-separated rows) and editors in one call; upload and drop_files attach local files; dialog answers alert/confirm/prompt; wait_for waits for slow results like exports.`;
 
@@ -44,19 +44,32 @@ async function guard(run: () => Promise<{ content: Content[] }>) {
   }
 }
 
-const tabParam = z.number().int().optional().describe('Tab id from `tabs`. Omit to use the selected tab (defaults to the tab in front). Works on background tabs without switching.');
-const refParam = z.number().int().describe('Element ref number from the snapshot, e.g. 12 for [12]');
+// z.number().int() puts ±2^53 bounds in the JSON schema of every integer field; multipleOf(1) validates the same in 14 chars.
+const int = () => z.number().multipleOf(1);
+const tabParam = int().optional().describe('Tab id from tabs. Default: the selected tab');
+const refParam = int().describe('Ref from the snapshot, e.g. 12 for [12]');
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 function snapshotText(tab: Tab, header: string[], lines: string[], truncated: boolean) {
   return [...header, ...lines, ...(truncated ? ['… snapshot truncated: use find, snapshot with a ref, or scroll'] : [])].join('\n') || '(empty page)';
 }
 
-/** Screenshot options. `scale` < 1 shrinks the image (image tokens grow with pixel area); `region: 'canvas'` crops to the largest visible canvas. */
-type ShotOpts = { ref?: number; scale?: number; region?: 'viewport' | 'canvas' };
+/** What to capture. Coordinates are viewport CSS pixels. */
+type ShotArea = { kind: 'viewport' } | { kind: 'canvas' } | { kind: 'ref'; ref: number } | { kind: 'clip'; x: number; y: number; w: number; h: number };
 
-async function screenshotOf(tab: Tab, opts: ShotOpts = {}) {
-  const scale = opts.scale ?? 1;
+const clipSchema = z.tuple([z.number(), z.number(), z.number().positive(), z.number().positive()]).describe('[x, y, w, h] viewport px');
+
+/** Tool input (ref | region | clip) → one area; more than one is a mistake worth reporting. */
+function shotArea(opts: { ref?: number; region?: 'viewport' | 'canvas'; clip?: [number, number, number, number] }): ShotArea {
+  const given = [opts.ref !== undefined, opts.region === 'canvas', opts.clip !== undefined].filter(Boolean).length;
+  if (given > 1) throw new ToolError('Pass only one of ref, region "canvas" or clip. Nothing was captured.');
+  if (opts.ref !== undefined) return { kind: 'ref', ref: opts.ref };
+  if (opts.clip) return { kind: 'clip', x: opts.clip[0], y: opts.clip[1], w: opts.clip[2], h: opts.clip[3] };
+  return opts.region === 'canvas' ? { kind: 'canvas' } : { kind: 'viewport' };
+}
+
+/** `scale` < 1 shrinks the image: image tokens grow with pixel area and stay in context for every later turn. */
+async function screenshotOf(tab: Tab, area: ShotArea, scale: number) {
   const metrics = await tab.page.send('Page.getLayoutMetrics');
   const vp = metrics.cssVisualViewport;
   const dpr = await tab.page.send('Runtime.evaluate', { expression: 'devicePixelRatio', returnByValue: true });
@@ -64,17 +77,24 @@ async function screenshotOf(tab: Tab, opts: ShotOpts = {}) {
   // Area in viewport CSS pixels.
   let box = { x: 0, y: 0, w: vp.clientWidth, h: vp.clientHeight };
   let what = 'the viewport';
-  if (opts.ref !== undefined) {
-    const p = await pointFor(tab, opts.ref);
-    const { quads } = await target(tab, opts.ref).session.send('DOM.getContentQuads', { backendNodeId: target(tab, opts.ref).backendNodeId });
+  if (area.kind === 'ref') {
+    const p = await pointFor(tab, area.ref);
+    const t = target(tab, area.ref);
+    const { quads } = await t.session.send('DOM.getContentQuads', { backendNodeId: t.backendNodeId });
     const q = quads[0] ?? [];
     const xs = [q[0], q[2], q[4], q[6]].map(Number);
     const ys = [q[1], q[3], q[5], q[7]].map(Number);
     const w = Math.max(...xs) - Math.min(...xs) + 40;
     const h = Math.max(...ys) - Math.min(...ys) + 40;
     box = { x: p.x - w / 2, y: p.y - h / 2, w, h };
-    what = `[${opts.ref}]`;
-  } else if (opts.region === 'canvas') {
+    what = `[${area.ref}]`;
+  } else if (area.kind === 'clip') {
+    const x0 = Math.max(0, area.x);
+    const y0 = Math.max(0, area.y);
+    box = { x: x0, y: y0, w: Math.min(vp.clientWidth, area.x + area.w) - x0, h: Math.min(vp.clientHeight, area.y + area.h) - y0 };
+    if (box.w <= 0 || box.h <= 0) throw new ToolError(`clip [${area.x}, ${area.y}, ${area.w}, ${area.h}] is outside the ${vp.clientWidth}x${vp.clientHeight} viewport. Nothing was captured.`);
+    what = 'the clip';
+  } else if (area.kind === 'canvas') {
     const info = await pageInfo(tab).catch(() => undefined);
     const biggest = info?.canvases.toSorted((a, b) => b[2] * b[3] - a[2] * a[3])[0];
     if (biggest) {
@@ -98,7 +118,15 @@ async function screenshotOf(tab: Tab, opts: ShotOpts = {}) {
     .catch((e) => {
       throw new ToolError(`Screenshot failed (${e instanceof Error ? e.message : String(e)}). The page itself is unchanged. A tab in a minimized window may not paint: snapshot still works, or ask the user to un-minimize the window.`);
     });
-  return { content: [{ type: 'text' as const, text: note }, { type: 'image' as const, data: shot.data, mimeType: 'image/jpeg' }] };
+  // An image identical to the last one from this tab adds tokens to every later turn and says nothing new.
+  const key = `${Bun.hash(shot.data)}:${JSON.stringify(clip)}`;
+  if (tab.lastShot === key) {
+    const same: Content[] = [{ type: 'text', text: `screenshot of ${what}: unchanged since the previous screenshot (image omitted; that one still applies)` }];
+    return { content: same };
+  }
+  tab.lastShot = key;
+  const content: Content[] = [{ type: 'text', text: note }, { type: 'image', data: shot.data, mimeType: 'image/jpeg' }];
+  return { content };
 }
 
 // Visible text of a document, including open shadow roots, same-origin iframes and form values.
@@ -133,10 +161,16 @@ async function pageText(tab: Tab) {
 /** Polls page text until `want` is present and `gone` is absent. Returns elapsed ms, or throws on timeout/dialog. */
 async function waitForText(tab: Tab, want: string | undefined, gone: string | undefined, timeoutMs: number) {
   const start = performance.now();
+  let last: { version: string | undefined; at: number } | undefined;
   for (;;) {
     if (tab.dialog) throw new ToolError(`A ${tab.dialog.type} dialog is blocking the page: "${tab.dialog.message}". Use dialog first.`);
-    const all = await pageText(tab);
-    if ((!want || all.includes(want.toLowerCase())) && (!gone || !all.includes(gone.toLowerCase()))) return Math.round(performance.now() - start);
+    // Reading all text walks every element: only do it when the page changed.
+    const version = await pageVersion(tab);
+    if (shouldReread(version, last, performance.now())) {
+      last = { version, at: performance.now() };
+      const all = await pageText(tab);
+      if ((!want || all.includes(want.toLowerCase())) && (!gone || !all.includes(gone.toLowerCase()))) return Math.round(performance.now() - start);
+    }
     if (performance.now() - start > timeoutMs) {
       throw new ToolError(`Timed out after ${timeoutMs}ms waiting for ${want ? `"${want}" to appear` : `"${gone}" to disappear`}. The page is unchanged otherwise; snapshot to see its state.`);
     }
@@ -148,7 +182,7 @@ async function waitForText(tab: Tab, want: string | undefined, gone: string | un
 
 server.registerTool(
   'tabs',
-  { description: 'List open tabs. The selected tab is marked with *. Visible tabs are in front in their window.' },
+  { description: 'List tabs. * = selected; visible = in front in its window.' },
   () =>
     guard(async () => {
       const b = await getBrowser();
@@ -165,7 +199,7 @@ server.registerTool(
 server.registerTool(
   'tab_open',
   {
-    description: 'Open a URL in a new tab and select it. By default it opens in the background so the user is not interrupted.',
+    description: 'Open a URL in a new tab (background by default) and select it.',
     inputSchema: { url: z.string(), background: z.boolean().default(true) },
   },
   ({ url, background }) =>
@@ -175,16 +209,16 @@ server.registerTool(
       b.current = targetId;
       const tab = await b.attach(targetId);
       const s = await waitForSettle(tab, 10_000);
-      const snap = await snapshot(tab, 300);
-      return text(`opened tab ${b.tabId(targetId)} (${s.kind === 'settled' ? `settled in ${s.ms}ms` : s.kind})\n${snapshotText(tab, snap.header, snap.lines, snap.truncated)}`);
+      const snap = await snapshot(tab, LIST_CAPPED);
+      return text(`opened tab ${b.tabId(targetId)} (${describeSettle(s)})\n${snapshotText(tab, snap.header, compactView(snap.lines, FULL_SNAPSHOT_LINES), false)}`);
     }),
 );
 
 server.registerTool(
   'tab_select',
   {
-    description: 'Make a tab the one later tools act on. It stays where it is: the user keeps the tab they are looking at.',
-    inputSchema: { tab: z.number().int() },
+    description: 'Make a tab the one later tools act on, without bringing it to front.',
+    inputSchema: { tab: int() },
   },
   ({ tab: tabId }) =>
     guard(async () => {
@@ -198,7 +232,7 @@ server.registerTool(
 
 server.registerTool(
   'tab_close',
-  { description: 'Close a tab.', inputSchema: { tab: z.number().int() } },
+  { description: 'Close a tab.', inputSchema: { tab: int() } },
   ({ tab: tabId }) =>
     guard(async () => {
       const b = await getBrowser();
@@ -210,8 +244,8 @@ server.registerTool(
 server.registerTool(
   'navigate',
   {
-    description: 'Go to a URL in the tab, or "back", "forward", "reload". Returns what the page looks like after it loads.',
-    inputSchema: { url: z.string().describe('URL, or back | forward | reload'), tab: tabParam },
+    description: 'Go to a URL, or back | forward | reload. Returns the loaded page.',
+    inputSchema: { url: z.string(), tab: tabParam },
   },
   ({ url, tab: tabId }) =>
     guard(async () => {
@@ -240,12 +274,11 @@ server.registerTool(
 server.registerTool(
   'snapshot',
   {
-    description:
-      'Read the page as an accessibility tree: one line per element, `[ref] role "name" state`. Use refs with click/type/etc. Includes iframes and shadow DOM. Canvas areas are listed with coordinates; use screenshot for them.',
+    description: 'Read the page as an accessibility tree, one `[ref] role "name" state` line per element, including iframes and shadow DOM. ref: only that subtree.',
     inputSchema: {
       tab: tabParam,
-      ref: z.number().int().optional().describe('Only show this element and its children'),
-      max_lines: z.number().int().default(400),
+      ref: int().optional(),
+      max_lines: int().default(400),
     },
   },
   ({ tab: tabId, ref, max_lines }) =>
@@ -261,7 +294,7 @@ server.registerTool(
       const body = snapshotText(tab, snap.header, snap.lines, snap.truncated);
       // Design rule: when the tree has almost nothing to say, add a screenshot automatically.
       if (snap.lines.length < 5 && !tab.dialog) {
-        const shot = await screenshotOf(tab).catch(() => undefined);
+        const shot = await screenshotOf(tab, { kind: 'viewport' }, 0.5).catch(() => undefined);
         if (shot) return { content: [{ type: 'text' as const, text: `${body}\n(tree is nearly empty, screenshot attached)` }, ...shot.content] };
       }
       return text(body);
@@ -271,8 +304,8 @@ server.registerTool(
 server.registerTool(
   'find',
   {
-    description: 'Search the whole page (all frames, no truncation) for elements whose line contains the text. Use on long or large pages.',
-    inputSchema: { query: z.string(), tab: tabParam, limit: z.number().int().default(30) },
+    description: 'Search the whole page (all frames, untruncated) for elements whose line contains the text.',
+    inputSchema: { query: z.string(), tab: tabParam, limit: int().default(30) },
   },
   ({ query, tab: tabId, limit }) =>
     guard(async () => {
@@ -288,25 +321,26 @@ server.registerTool(
   'screenshot',
   {
     description:
-      'Screenshot the viewport, one element (ref), or the largest canvas (region "canvas"). At scale 1 over the viewport, image pixels equal viewport CSS pixels for mouse tools; otherwise the result says how to convert. Images cost tokens by area and stay in context: use scale 0.5 for checking progress, 1 when reading exact coordinates.',
+      'Screenshot the viewport, an element (ref), the largest canvas (region), or a rectangle (clip). The result says how image pixels map to viewport coordinates. Scale 1 or clip for small text. Identical repeats are omitted.',
     inputSchema: {
       tab: tabParam,
-      ref: z.number().int().optional(),
-      scale: z.number().min(0.2).max(1).default(1),
+      ref: int().optional(),
+      clip: clipSchema.optional(),
+      scale: z.number().min(0.2).max(1).default(0.5),
       region: z.enum(['viewport', 'canvas']).default('viewport'),
     },
   },
-  ({ tab: tabId, ref, scale, region }) => guard(async () => screenshotOf(await getTab(tabId), { ref, scale, region })),
+  ({ tab: tabId, ref, clip, scale, region }) => guard(async () => screenshotOf(await getTab(tabId), shotArea({ ref, region, clip }), scale)),
 );
 
 server.registerTool(
   'wait_for',
   {
-    description: 'Wait until text appears (or disappears) in the page, e.g. "Export complete". Use when an action starts something slow.',
+    description: 'Wait until text appears, or until gone text disappears (slow exports, uploads).',
     inputSchema: {
       text: z.string().optional(),
-      gone: z.string().optional().describe('Wait until this text is no longer on the page'),
-      timeout_ms: z.number().int().default(15000),
+      gone: z.string().optional(),
+      timeout_ms: int().default(15000),
       tab: tabParam,
     },
   },
@@ -329,7 +363,7 @@ server.registerTool(
 server.registerTool(
   'click',
   {
-    description: 'Click an element by ref. Returns what changed on the page (diff, URL change, dialogs, new tabs, downloads).',
+    description: 'Click an element by ref.',
     inputSchema: {
       ref: refParam,
       button: z.enum(['left', 'right', 'middle']).default('left'),
@@ -354,7 +388,7 @@ server.registerTool(
 
 server.registerTool(
   'hover',
-  { description: 'Move the mouse over an element (menus, tooltips).', inputSchema: { ref: refParam, tab: tabParam } },
+  { description: 'Move the mouse over an element.', inputSchema: { ref: refParam, tab: tabParam } },
   ({ ref, tab: tabId }) =>
     guard(async () => {
       const tab = await getTab(tabId);
@@ -366,11 +400,10 @@ server.registerTool(
 server.registerTool(
   'type',
   {
-    description:
-      'Type text. With ref, clicks the element first to focus it. Works for inputs, textareas, rich text and code editors. clear replaces existing content; submit presses Enter after.',
+    description: 'Type text, clicking ref first if given. Works in inputs, rich text and code editors. clear replaces content; submit presses Enter.',
     inputSchema: {
       text: z.string(),
-      ref: z.number().int().optional(),
+      ref: int().optional(),
       clear: z.boolean().default(false),
       submit: z.boolean().default(false),
       tab: tabParam,
@@ -402,8 +435,8 @@ server.registerTool(
 server.registerTool(
   'press',
   {
-    description: 'Press a key or shortcut on the focused element: Enter, Escape, Tab, ArrowDown, Backspace, Meta+A, Shift+Tab, Control+Z…',
-    inputSchema: { keys: z.string(), times: z.number().int().min(1).max(100).default(1), tab: tabParam },
+    description: 'Press a key or combo on the focused element: Enter, Escape, ArrowDown, Meta+A, Shift+Tab…',
+    inputSchema: { keys: z.string(), times: int().min(1).max(100).default(1), tab: tabParam },
   },
   ({ keys, times, tab: tabId }) =>
     guard(async () => {
@@ -420,7 +453,7 @@ server.registerTool(
 server.registerTool(
   'select_option',
   {
-    description: 'Choose option(s) in a native <select> by value or visible label. For custom dropdowns, click them and click the option instead.',
+    description: 'Pick option(s) in a native <select> by value or label. Custom dropdowns: click instead.',
     inputSchema: { ref: refParam, values: z.array(z.string()).min(1), tab: tabParam },
   },
   ({ ref, values, tab: tabId }) =>
@@ -460,9 +493,9 @@ server.registerTool(
 server.registerTool(
   'scroll',
   {
-    description: 'Scroll an element into view (ref), or scroll by dy/dx pixels at a point (default: centre of the viewport). Positive dy scrolls down. Works inside scrollable panels when x,y is over them.',
+    description: 'Scroll ref into view, or by dx/dy pixels at x,y (default viewport centre; positive dy = down; x,y over a panel scrolls it).',
     inputSchema: {
-      ref: z.number().int().optional(),
+      ref: int().optional(),
       dy: z.number().default(0),
       dx: z.number().default(0),
       x: z.number().optional(),
@@ -496,12 +529,12 @@ const modBits = (mods: string[]) => mods.reduce((acc, m) => acc | ({ Alt: 1, Con
 server.registerTool(
   'mouse_click',
   {
-    description: 'Click at viewport coordinates (from a screenshot). For canvas apps and places without refs.',
+    description: 'Click at viewport coordinates (canvas apps, places without refs).',
     inputSchema: {
       x: z.number(),
       y: z.number(),
       button: z.enum(['left', 'right', 'middle']).default('left'),
-      count: z.number().int().min(1).max(3).default(1),
+      count: int().min(1).max(3).default(1),
       modifiers: modifiersSchema,
       tab: tabParam,
     },
@@ -516,10 +549,9 @@ server.registerTool(
 server.registerTool(
   'mouse_drag',
   {
-    description:
-      'Press at the first point, move through the others, release at the last. Use for drawing strokes on a canvas (many points = a curve), sliders, resizing and drag-and-drop. Viewport coordinates.',
+    description: 'Press at the first point, move through the rest, release at the last (strokes, sliders, drag and drop). Viewport coordinates.',
     inputSchema: {
-      path: z.array(pointSchema).min(2).describe('[[x,y], [x,y], ...]'),
+      path: z.array(pointSchema).min(2),
       button: z.enum(['left', 'right', 'middle']).default('left'),
       modifiers: modifiersSchema,
       tab: tabParam,
@@ -536,7 +568,7 @@ server.registerTool(
 server.registerTool(
   'mouse_strokes',
   {
-    description: 'Draw several separate strokes in one call (each stroke is a drag path). Much cheaper than many mouse_drag calls when painting.',
+    description: 'Draw several separate drag paths in one call.',
     inputSchema: { strokes: z.array(z.array(pointSchema).min(2)).min(1), tab: tabParam },
   },
   ({ strokes, tab: tabId }) =>
@@ -555,7 +587,7 @@ server.registerTool(
 // batch lets the agent do a known sequence (pick colour → paint → pick colour → paint → look) in one call.
 // Steps can name their target instead of using a ref, so one batch can walk through elements that
 // earlier steps create (open menu → click item → fill dialog) without a snapshot turn in between.
-const targetShape = { ref: z.number().int().optional(), name: z.string().optional(), role: z.string().optional() };
+const targetShape = { ref: int().optional(), name: z.string().optional(), role: z.string().optional() };
 type TargetSpec = { ref?: number; name?: string; role?: string };
 
 const NAME_WAIT_MS = 3000;
@@ -567,19 +599,25 @@ async function resolveRef(tab: Tab, t: TargetSpec) {
   const want = t.name.toLowerCase();
   const role = t.role?.toLowerCase();
   const start = performance.now();
+  let last: { version: string | undefined; at: number } | undefined;
   for (;;) {
-    const snap = await snapshot(tab);
-    remember(tab, snap);
-    let partial: number | undefined;
-    for (const l of snap.lines) {
-      const p = parseRefLine(l);
-      if (!p?.name) continue;
-      if (role && p.role.toLowerCase() !== role) continue;
-      const name = p.name.toLowerCase();
-      if (name === want) return p.ref;
-      if (partial === undefined && name.includes(want)) partial = p.ref;
+    // A full tree read per poll is heavy on big pages: only re-read when the page changed.
+    const version = await pageVersion(tab);
+    if (shouldReread(version, last, performance.now())) {
+      last = { version, at: performance.now() };
+      const snap = await snapshot(tab);
+      remember(tab, snap);
+      let partial: number | undefined;
+      for (const l of snap.lines) {
+        const p = parseRefLine(l);
+        if (!p?.name) continue;
+        if (role && p.role.toLowerCase() !== role) continue;
+        const name = p.name.toLowerCase();
+        if (name === want) return p.ref;
+        if (partial === undefined && name.includes(want)) partial = p.ref;
+      }
+      if (partial !== undefined) return partial;
     }
-    if (partial !== undefined) return partial;
     if (performance.now() - start > NAME_WAIT_MS) {
       throw new ToolError(`no element${role ? ` with role ${role}` : ''} named "${t.name}" appeared within ${NAME_WAIT_MS}ms; use find or snapshot to see what is there`);
     }
@@ -598,23 +636,33 @@ const stepSchema = z.discriminatedUnion('do', [
   z.object({ do: z.literal('click'), ...targetShape, double: z.boolean().default(false) }),
   z.object({ do: z.literal('type'), text: z.string(), ...targetShape, clear: z.boolean().default(false), submit: z.boolean().default(false) }),
   z.object({ do: z.literal('hover'), ...targetShape }),
-  z.object({ do: z.literal('mouse_click'), x: z.number(), y: z.number(), count: z.number().int().min(1).max(3).default(1) }),
+  z.object({ do: z.literal('mouse_click'), x: z.number(), y: z.number(), count: int().min(1).max(3).default(1) }),
   z.object({ do: z.literal('drag'), path: z.array(pointSchema).min(2) }),
   z.object({ do: z.literal('strokes'), strokes: z.array(z.array(pointSchema).min(2)).min(1) }),
   z.object({ do: z.literal('scroll'), dy: z.number().default(0), dx: z.number().default(0), x: z.number().optional(), y: z.number().optional() }),
   z.object({ do: z.literal('press'), keys: z.string() }),
   z.object({ do: z.literal('eval'), expression: z.string() }),
-  z.object({ do: z.literal('wait'), ms: z.number().int().min(0).max(10_000) }),
-  z.object({ do: z.literal('wait_for'), text: z.string().optional(), gone: z.string().optional(), timeout_ms: z.number().int().max(60_000).default(10_000) }),
-  z.object({ do: z.literal('screenshot'), scale: z.number().min(0.2).max(1).default(0.5), region: z.enum(['viewport', 'canvas']).default('viewport') }),
+  z.object({ do: z.literal('wait'), ms: int().min(0).max(10_000) }),
+  z.object({ do: z.literal('wait_for'), text: z.string().optional(), gone: z.string().optional(), timeout_ms: int().max(60_000).default(10_000) }),
+  z.object({ do: z.literal('screenshot'), scale: z.number().min(0.2).max(1).default(0.5), region: z.enum(['viewport', 'canvas']).default('viewport'), clip: clipSchema.optional() }),
+  z.object({
+    do: z.literal('read'),
+    query: z.string().optional(),
+    ref: int().optional(),
+    limit: int().min(1).max(100).default(20),
+  }),
 ]);
 type Step = z.infer<typeof stepSchema>;
 
 async function runStep(tab: Tab, step: Step, shots: Content[]) {
   switch (step.do) {
-    case 'click':
-      await click(tab, await pointFor(tab, await resolveRef(tab, step)), { count: step.double ? 2 : 1 });
-      return undefined;
+    case 'click': {
+      const ref = await resolveRef(tab, step);
+      const p = await pointFor(tab, ref);
+      const cover = await coveredBy(tab, ref, p);
+      await click(tab, p, { count: step.double ? 2 : 1 });
+      return cover ? `warning: the click point of [${ref}] was covered by ${cover}; the click may have hit that instead` : undefined;
+    }
     case 'type': {
       if (step.ref !== undefined || step.name !== undefined) {
         const ref = await resolveRef(tab, step);
@@ -661,17 +709,36 @@ async function runStep(tab: Tab, step: Step, shots: Content[]) {
       if (!step.text && !step.gone) throw new ToolError('wait_for needs text or gone');
       return `waited ${await waitForText(tab, step.text, step.gone, step.timeout_ms)}ms`;
     }
-    case 'screenshot':
-      shots.push(...(await screenshotOf(tab, { scale: step.scale, region: step.region })).content);
-      return 'screenshot attached';
+    case 'screenshot': {
+      const content = (await screenshotOf(tab, shotArea(step), step.scale)).content;
+      shots.push(...content);
+      return content.some((c) => c.type === 'image') ? 'screenshot attached' : 'screenshot unchanged since the previous one (image omitted)';
+    }
+    case 'read': {
+      if ((step.query === undefined) === (step.ref === undefined)) throw new ToolError('read needs exactly one of query or ref');
+      const snap = await snapshot(tab);
+      remember(tab, snap);
+      if (step.ref !== undefined) {
+        const lines = subtree(snap.lines, step.ref);
+        if (!lines) throw new ToolError(`[${step.ref}] is not on the page anymore`);
+        return ['read:', ...lines.slice(0, step.limit)].join('\n');
+      }
+      const q = step.query?.toLowerCase() ?? '';
+      const hits = snap.lines.filter((l) => l.toLowerCase().includes(q)).map((l) => `  ${l.trim()}`);
+      if (!hits.length) return `read: no element contains "${step.query}"`;
+      return [`read "${step.query}" (${hits.length} match(es)):`, ...hits.slice(0, step.limit)].join('\n');
+    }
   }
 }
+
+/** Steps that can open, close or re-render parts of the page; the next step should see the result. */
+const SETTLE_AFTER = new Set<Step['do']>(['click', 'type', 'press', 'mouse_click', 'hover']);
 
 server.registerTool(
   'batch',
   {
     description:
-      'Run steps in order in one call. Every call re-sends the whole conversation, so plan big batches: a whole phase of work per call (fill a whole form, walk a whole menu flow, do all edits of one kind), not one or two steps. click / type / hover take a ref, or a name (+ optional role) resolved when the step runs (waits up to 3s for it to appear), so one batch can open a menu, pick an item and fill the dialog it opens. Pointer: mouse_click, drag, strokes (many drag paths). Also: scroll, press, eval (top-level await ok), wait (ms), wait_for (text appears or is gone), screenshot (half scale by default; region "canvas" crops to the canvas). Stops at the first failing step. report "none" skips reading the page before and after (faster; for canvas work). screenshot: true attaches a half-scale screenshot at the end; images cost tokens and stay in context, so take one per phase, not per batch.',
+      'Run steps in order in one call; plan a whole phase per call. Stops at the first failing step. click/type/hover take ref, or name (+role) resolved when the step runs (waits up to 3s), so one batch can open a menu, pick an item and fill its dialog. After click/type/press/mouse_click/hover it waits for the page to settle, so wait is rarely needed. read returns elements matching query, or ref\'s subtree; eval returns its value (top-level await ok); screenshot is half scale (region "canvas" or clip crops). report "none" skips the before/after diff (canvas work). screenshot: true attaches one at the end.',
     inputSchema: {
       steps: z.array(stepSchema).min(1).max(200),
       screenshot: z.boolean().default(false),
@@ -693,6 +760,8 @@ server.registerTool(
             try {
               const note = await runStep(tab, step, shots);
               if (note) notes.push(`step ${i + 1}: ${note}`);
+              // The last step is followed by act's full settle.
+              if (i < steps.length - 1 && SETTLE_AFTER.has(step.do)) await waitBetweenSteps(tab);
             } catch (e) {
               const msg = (e instanceof Error ? e.message : String(e)).replace(/\.$/, '');
               return [...notes, `step ${i + 1} (${step.do}) failed: ${msg}. Steps before it ran; steps ${i + 1}-${steps.length} did not.`].join('\n');
@@ -702,7 +771,7 @@ server.registerTool(
         },
         { report: reportMode },
       );
-      if (withShot) shots.push(...(await screenshotOf(tab, { scale: 0.5 })).content);
+      if (withShot) shots.push(...(await screenshotOf(tab, { kind: 'viewport' }, 0.5)).content);
       return { content: [{ type: 'text' as const, text: report }, ...shots] };
     }),
 );
@@ -712,9 +781,8 @@ server.registerTool(
 server.registerTool(
   'upload',
   {
-    description:
-      'Attach local files. With ref: the <input type=file>, or a button that opens a file picker (it is clicked and the picker intercepted). Without ref: answers a file picker that already opened.',
-    inputSchema: { paths: z.array(z.string()).min(1), ref: z.number().int().optional(), tab: tabParam },
+    description: 'Attach local files. ref: a file input, or a button that opens a picker (intercepted). No ref: answer a picker that already opened.',
+    inputSchema: { paths: z.array(z.string()).min(1), ref: int().optional(), tab: tabParam },
   },
   ({ paths, ref, tab: tabId }) =>
     guard(async () => {
@@ -785,13 +853,12 @@ async function readFiles(paths: string[]) {
 server.registerTool(
   'paste',
   {
-    description:
-      'Paste like Cmd+V into the focused element (or ref, which is clicked first), without touching the real clipboard. text: tab-separated rows fill a spreadsheet range in one call. html: rich text for docs and editors. files: local paths, e.g. an image into a canvas or design app.',
+    description: 'Paste into the focused element (or ref, clicked first) without touching the clipboard. text: tab-separated rows fill a sheet range; html: rich text; files: local paths.',
     inputSchema: {
       text: z.string().optional(),
       html: z.string().optional(),
       files: z.array(z.string()).optional(),
-      ref: z.number().int().optional(),
+      ref: int().optional(),
       tab: tabParam,
     },
   },
@@ -825,8 +892,8 @@ server.registerTool(
 server.registerTool(
   'drop_files',
   {
-    description: 'Drag local files from outside the browser and drop them on an element (ref) or a point (x, y). Opens files in apps that accept drops: image and video editors, design tools, upload areas.',
-    inputSchema: { paths: z.array(z.string()).min(1), ref: z.number().int().optional(), x: z.number().optional(), y: z.number().optional(), tab: tabParam },
+    description: 'Drop local files on an element (ref) or point (x, y), as if dragged in from the desktop.',
+    inputSchema: { paths: z.array(z.string()).min(1), ref: int().optional(), x: z.number().optional(), y: z.number().optional(), tab: tabParam },
   },
   ({ paths, ref, x, y, tab: tabId }) =>
     guard(async () => {
@@ -849,7 +916,7 @@ server.registerTool(
 server.registerTool(
   'dialog',
   {
-    description: 'Accept or dismiss an alert / confirm / prompt / beforeunload dialog. text answers a prompt.',
+    description: 'Accept or dismiss an alert/confirm/prompt/beforeunload. text answers a prompt.',
     inputSchema: { accept: z.boolean(), text: z.string().optional(), tab: tabParam },
   },
   ({ accept, text: promptText, tab: tabId }) =>
@@ -860,13 +927,13 @@ server.registerTool(
       await tab.page.send('Page.handleJavaScriptDialog', { accept, promptText });
       tab.dialog = undefined;
       const s = await waitForSettle(tab);
-      return text(`${accept ? 'accepted' : 'dismissed'} ${d.type} "${d.message}"; ${s.kind === 'settled' ? `page settled in ${s.ms}ms` : s.kind}`);
+      return text(`${accept ? 'accepted' : 'dismissed'} ${d.type} "${d.message}"; ${describeSettle(s)}`);
     }),
 );
 
 server.registerTool(
   'downloads',
-  { description: 'List downloads seen since the server connected, with state and file path.' },
+  { description: 'List downloads with state and file path.' },
   () =>
     guard(async () => {
       const b = await getBrowser();
@@ -878,10 +945,10 @@ server.registerTool(
 server.registerTool(
   'grant_permissions',
   {
-    description: 'Grant site permissions so the browser does not show a prompt: geolocation, notifications, clipboardReadWrite, audioCapture, videoCapture, etc.',
+    description: 'Grant site permissions so no prompt appears.',
     inputSchema: {
       permissions: z.array(z.enum(['geolocation', 'notifications', 'clipboardReadWrite', 'clipboardSanitizedWrite', 'audioCapture', 'videoCapture', 'midi', 'storageAccess', 'windowManagement', 'localFonts'])),
-      origin: z.string().optional().describe('Defaults to the origin of the selected tab'),
+      origin: z.string().optional().describe('Default: the selected tab'),
       tab: tabParam,
     },
   },
@@ -899,7 +966,7 @@ server.registerTool(
 server.registerTool(
   'eval_js',
   {
-    description: 'Run JavaScript in the page and return the JSON result (top-level await ok). Escape hatch for reading data or app state the tree does not show.',
+    description: 'Run JavaScript in the page; returns the JSON result (top-level await ok).',
     inputSchema: { expression: z.string(), tab: tabParam },
   },
   ({ expression, tab: tabId }) =>

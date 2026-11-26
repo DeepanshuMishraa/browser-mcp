@@ -28,9 +28,23 @@ export type PendingDialog = { type: string; message: string; defaultPrompt: stri
 type Request = { startedAt: number; type: string | undefined; url: string };
 
 // Requests that never "finish" in a useful sense; counting them would mean the page never settles.
-const IGNORED_REQUEST_TYPES = new Set(['WebSocket', 'EventSource', 'Media', 'Ping', 'Preflight']);
+// Images and fonts only repaint what is already in the tree, so waiting for them delays every action
+// on icon-heavy pages (Gmail, Docs) without changing the result.
+const IGNORED_REQUEST_TYPES = new Set(['WebSocket', 'EventSource', 'Media', 'Ping', 'Preflight', 'Image', 'Font']);
 // Telemetry and long-poll endpoints fire on their own and say nothing about the action's result.
 const IGNORED_REQUEST_URL = /\/(log|logs|gen_204|collect|beacon|analytics|telemetry|metrics|ping|heartbeat|stats|ptracking|jserror|csi)\b|google-analytics|googletagmanager|doubleclick|sentry\.io|segment\.(io|com)|mixpanel|amplitude|hotjar|clarity\.ms/i;
+// Static images and fonts fetched by script (typed Fetch/XHR) by their path's extension.
+const STATIC_ASSET_PATH = /\.(png|jpe?g|gif|webp|avif|svg|ico|woff2?|ttf|otf)$/i;
+
+/** Requests that say nothing about whether an action's result has arrived. */
+export function isNoiseRequest(type: string | undefined, url: string) {
+  if ((type && IGNORED_REQUEST_TYPES.has(type)) || IGNORED_REQUEST_URL.test(url)) return true;
+  try {
+    return STATIC_ASSET_PATH.test(new URL(url).pathname);
+  } catch {
+    return false;
+  }
+}
 const LONG_REQUEST_MS = 5_000;
 
 export class Tab {
@@ -50,6 +64,8 @@ export class Tab {
   events: string[] = [];
   /** The last full snapshot and the page's mutation count when it was read; reused as an action's "before" if nothing changed since. */
   lastSnapshot: { lines: string[]; version: number; url: string } | undefined;
+  /** Hash and clip of the last screenshot returned for this tab, to omit an identical one. */
+  lastShot: string | undefined;
 
   constructor(
     readonly conn: CdpConnection,
@@ -125,7 +141,7 @@ export class Tab {
   // Keyed by requestId alone: an iframe's document request starts in the parent session
   // but finishes in the iframe's own session once it becomes an OOPIF.
   #requestStarted(requestId: string, type: Protocol.Network.ResourceType | undefined, url: string) {
-    if ((type && IGNORED_REQUEST_TYPES.has(type)) || IGNORED_REQUEST_URL.test(url)) return;
+    if (isNoiseRequest(type, url)) return;
     this.#requests.set(requestId, { startedAt: performance.now(), type, url });
     this.lastNetworkChange = performance.now();
   }

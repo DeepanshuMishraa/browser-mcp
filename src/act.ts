@@ -1,11 +1,13 @@
 // Run an action, wait for the page to settle, and report what changed.
-import { remember, snapshot } from './snapshot.ts';
+import { compactView, remember, snapshot } from './snapshot.ts';
 import { MUTATION_SCRIPT, type Tab } from './tab.ts';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export type Settle =
   | { kind: 'settled'; ms: number }
+  /** DOM went quiet but some requests were still loading; they are listed, not waited for. */
+  | { kind: 'quiet'; ms: number; pending: string[] }
   | { kind: 'dialog'; ms: number }
   | { kind: 'timeout'; ms: number; reason: string };
 
@@ -34,39 +36,105 @@ async function pageState(tab: Tab): Promise<PageState | undefined> {
   return undefined;
 }
 
+// Pages with background fetches (icons, prefetch, iframes) keep the network busy long after the
+// visible result is in. Once the DOM has been quiet this long, stop waiting for the network tail.
+const TAIL_DOM_QUIET_MS = 500;
+const TAIL_MIN_ELAPSED_MS = 1500;
+
+/** One observation of the page while waiting. Times are ms; `domQuietFor` is undefined when the page could not be read (navigating). */
+export type SettleProbe = { elapsed: number; pending: string[]; netQuietFor: number; domQuietFor: number | undefined; domQuietNeeded: number };
+
+/** Decides from one probe whether the page has settled, should be waited on, or has run out of time. */
+export function settleVerdict(p: SettleProbe, timeoutMs: number): Settle | { kind: 'wait' } {
+  const ms = Math.round(p.elapsed);
+  const netQuiet = p.pending.length === 0 && p.netQuietFor >= NETWORK_QUIET_MS;
+  const domQuiet = p.domQuietFor !== undefined && p.domQuietFor >= p.domQuietNeeded;
+  if (netQuiet && domQuiet) return { kind: 'settled', ms };
+  if (domQuiet && p.domQuietFor !== undefined && p.domQuietFor >= TAIL_DOM_QUIET_MS && p.elapsed >= TAIL_MIN_ELAPSED_MS) {
+    return { kind: 'quiet', ms, pending: p.pending };
+  }
+  if (p.elapsed > timeoutMs) {
+    const reason = !netQuiet ? `${p.pending.length} network request(s) still loading: ${p.pending.slice(0, 3).join(', ')}` : 'DOM still changing (animation or live content)';
+    return { kind: 'timeout', ms, reason };
+  }
+  return { kind: 'wait' };
+}
+
+type SettleOpts = {
+  /** The page was already mutating before the action: DOM quiet becomes a fixed minimum wait. */
+  live?: boolean;
+  /** false = only wait for the DOM (between batch steps). */
+  network?: boolean;
+  domQuietMs?: number;
+};
+
+/** Top document's mutation count and URL, or undefined while navigating. Cheap: one small evaluate. */
+export async function pageVersion(tab: Tab) {
+  const s = await pageState(tab);
+  return s && `${s.version}:${s.url}`;
+}
+
+/**
+ * True when a poll should re-read the page: it changed since `last`, or `forceMs` passed.
+ * The mutation counter only sees the top document, so iframe-only changes are caught by the forced read.
+ */
+export function shouldReread(current: string | undefined, last: { version: string | undefined; at: number } | undefined, now: number, forceMs = 1000) {
+  return !last || current === undefined || current !== last.version || now - last.at >= forceMs;
+}
+
 /** Settled = no new network requests and no DOM mutations for a short window since the action. Gives up after `timeoutMs`. */
-export async function waitForSettle(tab: Tab, timeoutMs = 5000, opts: { live?: boolean } = {}): Promise<Settle> {
+export async function waitForSettle(tab: Tab, timeoutMs = 5000, opts: SettleOpts = {}): Promise<Settle> {
   const start = performance.now();
+  const network = opts.network ?? true;
+  const domQuietNeeded = opts.domQuietMs ?? (opts.live ? LIVE_MIN_WAIT_MS : DOM_QUIET_MS);
   await sleep(MIN_WAIT_MS);
-  let reason = 'page still changing';
   for (;;) {
-    const now = performance.now();
-    const ms = Math.round(now - start);
-    if (tab.dialog) return { kind: 'dialog', ms };
-    const net = tab.inflight(start);
-    const netQuiet = net.length === 0 && (tab.lastNetworkChange < start || now - tab.lastNetworkChange >= NETWORK_QUIET_MS);
-    let domQuiet = false;
-    if (opts.live) domQuiet = now - start >= LIVE_MIN_WAIT_MS;
+    if (tab.dialog) return { kind: 'dialog', ms: Math.round(performance.now() - start) };
+    let domQuietFor: number | undefined;
+    if (opts.live) domQuietFor = performance.now() - start;
     else {
       const s = await pageState(tab);
-      domQuiet = s !== undefined && Math.min(s.idle, performance.now() - start) >= DOM_QUIET_MS;
+      domQuietFor = s === undefined ? undefined : Math.min(s.idle, performance.now() - start);
     }
-    if (netQuiet && domQuiet) return { kind: 'settled', ms };
-    reason = !netQuiet ? `${net.length} network request(s) still loading: ${net.slice(0, 3).join(', ')}` : 'DOM still changing (animation or live content)';
-    if (ms > timeoutMs) return { kind: 'timeout', ms, reason };
+    const now = performance.now();
+    const v = settleVerdict(
+      {
+        elapsed: now - start,
+        pending: network ? tab.inflight(start) : [],
+        netQuietFor: !network || tab.lastNetworkChange < start ? Number.POSITIVE_INFINITY : now - tab.lastNetworkChange,
+        domQuietFor,
+        domQuietNeeded,
+      },
+      timeoutMs,
+    );
+    if (v.kind !== 'wait') return v;
     await sleep(50);
   }
 }
 
-function describeSettle(s: Settle) {
+const STEP_DOM_QUIET_MS = 150;
+const STEP_LIVE_WAIT_MS = 100;
+const STEP_TIMEOUT_MS = 1500;
+
+/** Short DOM-only wait between batch steps, so the next step sees what the last one opened. */
+export async function waitBetweenSteps(tab: Tab) {
+  const pre = await pageState(tab);
+  const live = pre !== undefined && pre.idle < LIVE_IDLE_MS;
+  return waitForSettle(tab, STEP_TIMEOUT_MS, { network: false, live, domQuietMs: live ? STEP_LIVE_WAIT_MS : STEP_DOM_QUIET_MS });
+}
+
+export function describeSettle(s: Settle) {
   if (s.kind === 'settled') return `settled ${s.ms}ms`;
+  if (s.kind === 'quiet') return `settled ${s.ms}ms; still loading in background: ${s.pending.slice(0, 2).join(', ') || 'requests'}`;
   if (s.kind === 'dialog') return `a dialog opened after ${s.ms}ms and is blocking the page`;
   return `page did not settle within ${s.ms}ms (${s.reason}); result below may be incomplete — wait_for or snapshot again if needed`;
 }
 
 const MAX_DIFF_LINES = 60;
 const MAX_REMOVED_LINES = 15;
-const FULL_SNAPSHOT_LINES = 300;
+export const FULL_SNAPSHOT_LINES = 150;
+/** A line limit high enough that only list capping applies. */
+export const LIST_CAPPED = 2000;
 
 /** `diff`: report what changed (reads the page before and after). `none`: only settle and events (fast; for canvas work). */
 export type Report = 'diff' | 'none';
@@ -109,8 +177,9 @@ export async function act(tab: Tab, label: string, run: () => Promise<string | u
       if (navigated) out.push(`url: ${urlBefore} → ${urlAfter}`);
       const d = diff(before, after.lines, navigated);
       if (d === 'full') {
-        const view = after.lines.length > FULL_SNAPSHOT_LINES ? await snapshot(tab, FULL_SNAPSHOT_LINES) : after;
-        out.push('new snapshot:', ...view.header, ...view.lines, ...(view.truncated ? ['… truncated (use snapshot with a ref, find, or scroll)'] : []));
+        // Long lists capped at 40 items, then only elements if text does not fit: a new page is mostly chrome.
+        const view = after.lines.length > FULL_SNAPSHOT_LINES ? await snapshot(tab, LIST_CAPPED) : after;
+        out.push('new snapshot:', ...view.header, ...compactView(view.lines, FULL_SNAPSHOT_LINES));
       } else out.push(...d);
     }
   }
