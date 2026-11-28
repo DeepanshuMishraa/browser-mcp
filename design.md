@@ -103,6 +103,10 @@ So when in the second step you know when aaction would happen like click happens
 
 - name lookups in batch and wait_for re-read the whole tree / all text every 100-150ms. now they only re-read when the top document's mutation count changed, plus once a second for changes inside iframes
 
+- bot challenges: after every document navigation (and `tab_open`) the page is probed for Cloudflare, PerimeterX, DataDome, Akamai, Imperva, AWS WAF, reCAPTCHA/hCaptcha walls and generic "access denied"/"verify you are human" pages (generic phrases only on short pages). Checks that clear by themselves are waited out (up to 15s, `MINI_BROWSER_CHALLENGE_WAIT_MS`); interactive ones tell the agent to hand off to the user; blocks tell it to stop instead of retry-looping
+
+- human-like input (on by default, `MINI_BROWSER_HUMAN_INPUT=0` turns it off): clicks and hovers move along a curved, eased path from the last pointer position (Fitts-scaled, ~80-650ms), land a pixel or two off centre and hold 60-140ms; key presses are spaced 30-110ms. Drag strokes stay exact, only the approach is curved. Costs roughly 0.2-0.8s per click
+
 - tool schemas went 22.0k → 16.3k chars (26 tools). `z.number().int()` wrote ±2^53 bounds into every integer field (81 times), now `multipleOf(1)`; the `tab` param description was repeated in 21 tools; descriptions no longer repeat the cost advice that is already in the server instructions. kept all tools: merging them would save about $0.04 a run and break callers
 
 

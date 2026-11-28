@@ -1,6 +1,7 @@
 // One attached tab: its page session, out-of-process iframe sessions, and everything we observe on it.
 import type { Protocol } from 'devtools-protocol';
 import { type CdpConnection, Session } from './cdp.ts';
+import type { Point } from './human.ts';
 
 export const MUTATION_SCRIPT = `(() => {
   if (window.__mbLastMutation !== undefined) return;
@@ -66,6 +67,12 @@ export class Tab {
   lastSnapshot: { lines: string[]; version: number; url: string } | undefined;
   /** Hash and clip of the last screenshot returned for this tab, to omit an identical one. */
   lastShot: string | undefined;
+  /** Where our last mouse event left the pointer (viewport CSS px); human-like moves start here. */
+  pointer: Point | undefined;
+  /** performance.now() of the last key release, to space key presses. */
+  lastKeyAt = 0;
+  /** performance.now() of the last top-level document navigation (not same-document history changes). */
+  mainNavigatedAt = 0;
 
   constructor(
     readonly conn: CdpConnection,
@@ -113,7 +120,9 @@ export class Tab {
         this.#log('file picker opened (intercepted): call upload with file paths');
       });
       s.on('Page.frameNavigated', (p) => {
-        if (!p.frame.parentId) this.#requests.clear();
+        if (p.frame.parentId) return;
+        this.#requests.clear();
+        this.mainNavigatedAt = performance.now();
       });
     }
 

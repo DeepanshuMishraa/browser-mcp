@@ -1,4 +1,5 @@
 // Run an action, wait for the page to settle, and report what changed.
+import { describeChallenge, detectChallenge } from './challenge.ts';
 import { compactView, remember, snapshot } from './snapshot.ts';
 import { MUTATION_SCRIPT, type Tab } from './tab.ts';
 
@@ -164,9 +165,14 @@ export async function act(tab: Tab, label: string, run: () => Promise<string | u
   }
   tab.takeEvents();
 
+  const started = performance.now();
   const note = await run();
-  const settle = await waitForSettle(tab, 5000, { live });
+  let settle = await waitForSettle(tab, 5000, { live });
+  // After a document navigation, check for a bot challenge; an auto check is waited out before reading the page.
+  const challenge = tab.mainNavigatedAt >= started ? await detectChallenge(tab) : undefined;
+  if (challenge?.status === 'cleared') settle = await waitForSettle(tab, 5000);
   const out = [`${label} (${describeSettle(settle)})`, ...(note ? [note] : [])];
+  if (challenge) out.push(describeChallenge(challenge, (await pageState(tab))?.url ?? ''));
 
   if (report === 'diff' && settle.kind !== 'dialog') {
     const after = await snapshot(tab).catch(() => undefined);

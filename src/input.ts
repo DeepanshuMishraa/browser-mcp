@@ -2,10 +2,11 @@
 // Input always goes to the top-level page session in viewport CSS pixels; this works for background tabs too.
 import { CdpError, type Session } from './cdp.ts';
 import { ToolError } from './browser.ts';
+import { HUMAN_INPUT, humanPath, nearby, pause, type Point } from './human.ts';
 import { parseRefLine, remember, snapshot } from './snapshot.ts';
 import type { RefTarget, Tab } from './tab.ts';
 
-export type Point = { x: number; y: number };
+export type { Point };
 
 export function target(tab: Tab, ref: number) {
   const t = tab.refs.get(ref);
@@ -134,17 +135,33 @@ export async function coveredBy(tab: Tab, ref: number, p: Point) {
 
 type Button = 'left' | 'right' | 'middle';
 
+/** One mouseMoved event straight to `p`. */
 export async function mouseMove(tab: Tab, p: Point, button: Button | 'none' = 'none', modifiers = 0) {
+  tab.pointer = { x: p.x, y: p.y };
   await tab.page.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: p.x, y: p.y, button, buttons: button === 'none' ? 0 : 1, modifiers });
 }
 
-export async function click(tab: Tab, p: Point, opts: { button?: Button; count?: number; modifiers?: number } = {}) {
+/** Moves the pointer to `p`: along a human-like path from where it last was when human input is on, else in one jump. */
+export async function moveTo(tab: Tab, p: Point, modifiers = 0) {
+  const from = tab.pointer;
+  if (!HUMAN_INPUT || !from) return mouseMove(tab, p, 'none', modifiers);
+  for (const { x, y, delayMs } of humanPath(from, p)) {
+    await sleep(delayMs);
+    await mouseMove(tab, { x, y }, 'none', modifiers);
+  }
+}
+
+export async function click(tab: Tab, target: Point, opts: { button?: Button; count?: number; modifiers?: number } = {}) {
   const button = opts.button ?? 'left';
   const count = opts.count ?? 1;
   const modifiers = opts.modifiers ?? 0;
-  await mouseMove(tab, p, 'none', modifiers);
+  const p = HUMAN_INPUT ? nearby(target) : target;
+  await moveTo(tab, p, modifiers);
+  await pause(30, 80);
   for (let i = 1; i <= count; i++) {
+    if (i > 1) await pause(70, 130);
     await tab.page.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: p.x, y: p.y, button, buttons: 1, clickCount: i, modifiers });
+    await pause(60, 140);
     // A click that opens alert()/confirm() does not get a reply until the dialog closes: stop waiting once it opens.
     const released = tab.page.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: p.x, y: p.y, button, buttons: 0, clickCount: i, modifiers });
     await raceDialog(tab, released);
@@ -175,7 +192,8 @@ export async function drag(tab: Tab, path: Point[], opts: { button?: Button; mod
   const button = opts.button ?? 'left';
   const modifiers = opts.modifiers ?? 0;
   const step = opts.stepPx ?? 6;
-  await mouseMove(tab, first, 'none', modifiers);
+  // Only the approach is human-like: the stroke itself follows the given path exactly (drawing, sliders).
+  await moveTo(tab, first, modifiers);
   await tab.page.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: first.x, y: first.y, button, buttons: 1, clickCount: 1, modifiers });
   // Many drag libraries and canvas apps start a drag on the next animation frame after the press.
   await sleep(DRAG_DWELL_MS);
@@ -199,6 +217,7 @@ export async function drag(tab: Tab, path: Point[], opts: { button?: Button; mod
 }
 
 export async function wheel(tab: Tab, p: Point, dx: number, dy: number) {
+  tab.pointer = { x: p.x, y: p.y };
   await tab.page.send('Input.dispatchMouseEvent', { type: 'mouseWheel', x: p.x, y: p.y, deltaX: dx, deltaY: dy });
 }
 
@@ -258,10 +277,16 @@ export async function press(tab: Tab, combo: string) {
   const command = process.platform === 'darwin' && modifiers & 4 ? MAC_COMMANDS[def.key.toLowerCase()] : undefined;
   const commands = command ? [modifiers & 8 && command === 'undo' ? 'redo' : command] : undefined;
   const base = { key: def.key, code: def.code, windowsVirtualKeyCode: def.keyCode, modifiers };
+  if (HUMAN_INPUT) {
+    const gap = tab.lastKeyAt + 30 + Math.random() * 80 - performance.now();
+    if (gap > 0) await sleep(gap);
+  }
   const down = tab.page.send('Input.dispatchKeyEvent', { type: text ? 'keyDown' : 'rawKeyDown', ...base, text, unmodifiedText: text, commands });
   await raceDialog(tab, down);
   if (tab.dialog) return;
+  await pause(25, 70);
   await tab.page.send('Input.dispatchKeyEvent', { type: 'keyUp', ...base });
+  tab.lastKeyAt = performance.now();
 }
 
 export async function insertText(tab: Tab, text: string) {

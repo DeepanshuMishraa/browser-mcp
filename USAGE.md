@@ -63,4 +63,6 @@ Every action returns what happened: whether the page settled (and how long it to
 - `src/snapshot.ts`: accessibility tree to text
 - `src/act.ts`: settle detection and action diff
 - `src/input.ts`: ref to point, mouse and keyboard, cover check, stale-ref check
+- `src/human.ts`: human-like pointer paths and input timing (`MINI_BROWSER_HUMAN_INPUT=0` to turn off)
+- `src/challenge.ts`: bot-challenge and block-page detection after navigations (`MINI_BROWSER_CHALLENGE_WAIT_MS`, default 15000)
 - `src/index.ts`: MCP tools

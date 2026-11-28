@@ -4,7 +4,8 @@ import { basename, resolve } from 'node:path';
 import { z } from 'zod';
 import { act, describeSettle, FULL_SNAPSHOT_LINES, LIST_CAPPED, pageVersion, shouldReread, waitBetweenSteps, waitForSettle } from './act.ts';
 import { Browser, ToolError } from './browser.ts';
-import { click, coveredBy, drag, insertText, mouseMove, pointFor, press, raceDialog, target, wheel } from './input.ts';
+import { describeChallenge, detectChallenge } from './challenge.ts';
+import { click, coveredBy, drag, insertText, moveTo, pointFor, press, raceDialog, target, wheel } from './input.ts';
 import { compactView, pageInfo, parseRefLine, remember, snapshot, subtree } from './snapshot.ts';
 import type { Tab } from './tab.ts';
 import { trace } from './trace.ts';
@@ -208,9 +209,13 @@ server.registerTool(
       const { targetId } = await b.conn.send('Target.createTarget', { url, background });
       b.current = targetId;
       const tab = await b.attach(targetId);
-      const s = await waitForSettle(tab, 10_000);
+      let s = await waitForSettle(tab, 10_000);
+      // The first navigation may finish before we attach, so always check for a bot challenge here.
+      const challenge = await detectChallenge(tab);
+      if (challenge?.status === 'cleared') s = await waitForSettle(tab, 10_000);
       const snap = await snapshot(tab, LIST_CAPPED);
-      return text(`opened tab ${b.tabId(targetId)} (${describeSettle(s)})\n${snapshotText(tab, snap.header, compactView(snap.lines, FULL_SNAPSHOT_LINES), false)}`);
+      const note = challenge ? `${describeChallenge(challenge, snap.info?.url ?? url)}\n` : '';
+      return text(`opened tab ${b.tabId(targetId)} (${describeSettle(s)})\n${note}${snapshotText(tab, snap.header, compactView(snap.lines, FULL_SNAPSHOT_LINES), false)}`);
     }),
 );
 
@@ -393,7 +398,7 @@ server.registerTool(
     guard(async () => {
       const tab = await getTab(tabId);
       const t = target(tab, ref);
-      return text(await act(tab, `hovered [${ref}] ${t.role} "${t.name}"`, async () => (await mouseMove(tab, await pointFor(tab, ref)), undefined)));
+      return text(await act(tab, `hovered [${ref}] ${t.role} "${t.name}"`, async () => (await moveTo(tab, await pointFor(tab, ref)), undefined)));
     }),
 );
 
@@ -679,7 +684,7 @@ async function runStep(tab: Tab, step: Step, shots: Content[]) {
       return undefined;
     }
     case 'hover':
-      await mouseMove(tab, await pointFor(tab, await resolveRef(tab, step)));
+      await moveTo(tab, await pointFor(tab, await resolveRef(tab, step)));
       return undefined;
     case 'mouse_click':
       await click(tab, { x: step.x, y: step.y }, { count: step.count });
